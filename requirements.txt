@@ -1,0 +1,7 @@
+openai>=1.0.0
+PyMuPDF>=1.24.0
+pdfplumber>=0.11.0
+pypdf>=5.0.0
+reportlab>=4.0.0
+Pillow>=10.0.0
+mineru==3.2.2

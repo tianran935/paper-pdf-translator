@@ -1,0 +1,179 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  translate INPUT_PDF_OR_DIR OUTPUT_DIR
+
+Examples:
+  translate paper.pdf output/paper-cn
+  translate /path/to/pdfs output/translated-pdfs
+
+Outputs per PDF:
+  中文_<original-name>.pdf  bilingual reading PDF
+  中文_<original-name>.md   bilingual Markdown
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -ne 2 ]]; then
+  usage
+  exit 2
+fi
+
+SCRIPT_PATH="${0:A}"
+PROJECT_DIR="${SCRIPT_PATH:h}"
+VENV_DIR="$PROJECT_DIR/.venv"
+PYTHON="$VENV_DIR/bin/python"
+INPUT="$1"
+OUTPUT_ROOT="$2"
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "Python venv not found: $PYTHON" >&2
+  exit 1
+fi
+
+mkdir -p "$PROJECT_DIR/tmp" "$OUTPUT_ROOT"
+
+if [[ -f "$HOME/.zshrc" ]]; then
+  source "$HOME/.zshrc" >/dev/null 2>&1 || true
+fi
+
+if [[ -n "${QWEN_API_KEY:-}" ]]; then
+  export OPENAI_API_KEY="$QWEN_API_KEY"
+fi
+if [[ -n "${QWEN_BASE_URL:-}" ]]; then
+  export OPENAI_BASE_URL="$QWEN_BASE_URL"
+fi
+MODEL="${QWEN_MODEL:-${OPENAI_MODEL:-gpt-4.1}}"
+MINERU_BACKEND="${MINERU_BACKEND:-pipeline}"
+MINERU_METHOD="${MINERU_METHOD:-auto}"
+MINERU_LANG="${MINERU_LANG:-en}"
+
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "OPENAI_API_KEY or QWEN_API_KEY is required." >&2
+  exit 1
+fi
+
+slugify() {
+  local name="$1"
+  name="${name:r}"
+  name="${name// /-}"
+  name="${name//[^A-Za-z0-9._-]/-}"
+  print -r -- "$name"
+}
+
+cleanup_output_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -type f ! \( -iname '*.pdf' -o -iname '*.md' \) -delete
+  find "$dir" -depth -type d -empty -delete
+}
+
+translate_one() {
+  local pdf="$1"
+  local out_dir="$2"
+  local base_name original_stem slug content_list mineru_content_list asset_base readable_pdf markdown_file work_dir
+
+  pdf="$(cd "$(dirname "$pdf")" && pwd)/$(basename "$pdf")"
+  base_name="$(basename "$pdf")"
+  original_stem="${base_name:r}"
+  slug="$(slugify "$base_name")"
+  work_dir="$PROJECT_DIR/tmp/${slug}-formula-crop-tex"
+  readable_pdf="$out_dir/中文_${base_name}"
+  markdown_file="$out_dir/中文_${original_stem}.md"
+
+  mkdir -p "$out_dir"
+
+  echo "==> Translating: $pdf"
+  echo "==> Output:      $out_dir"
+
+  (
+    cd "$PROJECT_DIR"
+    OPENAI_API_KEY="$OPENAI_API_KEY" \
+    OPENAI_BASE_URL="${OPENAI_BASE_URL:-}" \
+    OPENAI_MODEL="$MODEL" \
+    "$PYTHON" tools/mineru_translate_workflow.py \
+      "$pdf" \
+      --out-dir "$out_dir" \
+      --mineru-cmd "$VENV_DIR/bin/mineru" \
+      --mineru-backend "$MINERU_BACKEND" \
+      --mineru-method "$MINERU_METHOD" \
+      --mineru-lang "$MINERU_LANG" \
+      --bilingual \
+      --request-timeout 120
+  )
+
+  content_list="$out_dir/translated_content_list.json"
+  mineru_content_list="$(find "$out_dir/mineru" -name '*_content_list.json' -print -quit 2>/dev/null || true)"
+  asset_base=""
+  if [[ -n "$mineru_content_list" ]]; then
+    asset_base="$(dirname "$mineru_content_list")"
+  fi
+
+  if [[ -f "$content_list" && -n "$asset_base" ]]; then
+    echo "==> Building readable PDF..."
+    (
+      cd "$PROJECT_DIR"
+      "$PYTHON" tools/render_tex_with_formula_crops.py \
+        "$content_list" \
+        "$pdf" \
+        "$readable_pdf" \
+        --work-dir "$work_dir" \
+        --asset-base "$asset_base"
+    ) || {
+      echo "Warning: formula-crop readable PDF render failed; trying Markdown fallback." >&2
+      (
+        cd "$PROJECT_DIR"
+        "$PYTHON" tools/render_translated_markdown_tex.py \
+          "$out_dir/translated.md" \
+          "$readable_pdf" \
+          --work-dir "${work_dir}-markdown"
+      ) || {
+        echo "Warning: Markdown PDF render failed; markdown was still generated." >&2
+      }
+    }
+  fi
+  if [[ -f "$out_dir/translated.md" ]]; then
+    mv -f "$out_dir/translated.md" "$markdown_file"
+  fi
+
+  echo "==> Cleaning intermediate files..."
+  cleanup_output_dir "$out_dir"
+  rm -rf "$work_dir" "${work_dir}-markdown"
+
+  echo "==> Done: $out_dir"
+  if [[ -f "$readable_pdf" ]]; then
+    echo "    Recommended: $readable_pdf"
+  fi
+  if [[ -f "$markdown_file" ]]; then
+    echo "    Markdown:    $markdown_file"
+  fi
+}
+
+if [[ -f "$INPUT" ]]; then
+  if [[ "${INPUT:l}" != *.pdf ]]; then
+    echo "Input file must be a PDF: $INPUT" >&2
+    exit 1
+  fi
+  translate_one "$INPUT" "$(cd "$(dirname "$OUTPUT_ROOT")" && pwd)/$(basename "$OUTPUT_ROOT")"
+elif [[ -d "$INPUT" ]]; then
+  pdfs=("$INPUT"/*.pdf(N))
+  if [[ ${#pdfs[@]} -eq 0 ]]; then
+    echo "No PDF files found under: $INPUT" >&2
+    exit 1
+  fi
+  output_abs="$(mkdir -p "$OUTPUT_ROOT" && cd "$OUTPUT_ROOT" && pwd)"
+  for pdf in "${pdfs[@]}"; do
+    slug="$(slugify "$(basename "$pdf")")"
+    translate_one "$pdf" "$output_abs/${slug}-mineru"
+  done
+else
+  echo "Input not found: $INPUT" >&2
+  exit 1
+fi
